@@ -1,0 +1,83 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Informational (non-gating) probe: build + run the integration tests against
+# the latest Apache Maven 4.0.0-SNAPSHOT distribution, but with its bundled
+# maven-resolver-* jars swapped for the latest maven-resolver 2.0.20-SNAPSHOT
+# build from the Apache snapshots repository. This isolates whether the
+# DRP-exclusion ITs (dep-reduced-pom-exclusions, MSHADE-467_parallel-...)
+# are fixed by the newer resolver, independent of which resolver the daily
+# Maven dist happens to bundle. Both the dist and the resolver SNAPSHOTs move,
+# so treat the result as a signal, not a merge gate.
+name: Verify against Maven 4.0.0-SNAPSHOT + resolver 2.0.20-SNAPSHOT
+
+on: [push, pull_request]
+
+jobs:
+  verify-maven4-snapshot-resolver220:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'zulu'
+          cache: 'maven'
+      - name: Install latest Maven 4.0.0-SNAPSHOT distribution
+        run: |
+          set -euo pipefail
+          BASE=https://repository.apache.org/content/repositories/snapshots/org/apache/maven/apache-maven/4.0.0-SNAPSHOT
+          V=$(curl -fsSL "$BASE/maven-metadata.xml" \
+              | grep -m1 -A4 '<classifier>bin</classifier>' \
+              | grep -m1 -oE '<value>[^<]+</value>' | sed 's/<[^>]*>//g')
+          echo "Resolved Maven snapshot build: $V"
+          curl -fsSL -o /tmp/m4.zip "$BASE/apache-maven-$V-bin.zip"
+          unzip -q /tmp/m4.zip -d /tmp/m4
+          echo "/tmp/m4/apache-maven-4.0.0-SNAPSHOT/bin" >> "$GITHUB_PATH"
+      - name: Swap bundled maven-resolver jars for 2.0.20-SNAPSHOT
+        run: |
+          set -euo pipefail
+          LIB=/tmp/m4/apache-maven-4.0.0-SNAPSHOT/lib
+          RBASE=https://repository.apache.org/content/repositories/snapshots/org/apache/maven/resolver
+          # maven-resolver-provider is a Maven core module (org.apache.maven,
+          # versioned with the dist) and must NOT be swapped. These are the
+          # org.apache.maven.resolver modules that ship in lib/.
+          MODULES="api connector-basic impl named-locks spi transport-apache transport-file transport-wagon util"
+          echo "Before swap:"
+          ls "$LIB" | grep -E 'maven-resolver-' || true
+          for m in $MODULES; do
+            module="maven-resolver-$m"
+            meta="$RBASE/$module/2.0.20-SNAPSHOT/maven-metadata.xml"
+            ts=$(curl -fsSL "$meta" | grep -m1 '<timestamp>' | sed 's/.*<timestamp>\(.*\)<\/timestamp>.*/\1/')
+            bn=$(curl -fsSL "$meta" | grep -m1 '<buildNumber>' | sed 's/.*<buildNumber>\(.*\)<\/buildNumber>.*/\1/')
+            newver="2.0.20-${ts}-${bn}"
+            url="$RBASE/$module/2.0.20-SNAPSHOT/${module}-${newver}.jar"
+            echo "Swapping $module -> $newver"
+            # Drop whatever release version of this module the dist bundled.
+            rm -f "$LIB/$module"-*.jar
+            curl -fsSL -o "$LIB/${module}-2.0.20-SNAPSHOT.jar" "$url"
+          done
+          echo "After swap:"
+          ls "$LIB" | grep -E 'maven-resolver-'
+          if ls "$LIB" | grep -E 'maven-resolver-(api|connector-basic|impl|named-locks|spi|transport-apache|transport-file|transport-wagon|util)-2\.0\.(18|19)\.jar' ; then
+            echo "ERROR: a non-swapped released resolver jar remains in lib/"; exit 1
+          fi
+      - run: mvn -v
+      - name: Build + run ITs against 4.0.0-SNAPSHOT + resolver 2.0.20-SNAPSHOT
+        run: mvn -B -P run-its clean verify --no-transfer-progress
